@@ -1,11 +1,11 @@
 {
     "MINIMAP": {
-        "top": 323,
-        "left": 1298,
-        "width": 190,
-        "height": 190
+        "top": 309,
+        "left": 1837,
+        "width": 180,
+        "height": 180
     },
-    "WINDOW_GEOMETRY": "400x400+1500+100",
+    "WINDOW_GEOMETRY": "700x350+1500+100",
     "VIEW_SIZE": 400,
     "LOGIC_MAP_PATH": "big_map.png",
     "DISPLAY_MAP_PATH": "big_map-1.png",
@@ -16,10 +16,10 @@
     "SIFT_MIN_MATCH_COUNT": 5,
     "SIFT_RANSAC_THRESHOLD": 8.0,
     "AI_REFRESH_RATE": 50,
-    "AI_CONFIDENCE_THRESHOLD": 0.6,
+    "AI_CONFIDENCE_THRESHOLD": 0.55,
     "AI_MIN_MATCH_COUNT": 9,
     "AI_RANSAC_THRESHOLD": 8.0,
-    "AI_SCAN_SIZE": 1600,
-    "AI_SCAN_STEP": 1400,
-    "AI_TRACK_RADIUS": 500
+    "AI_SCAN_SIZE": 400,
+    "AI_SCAN_STEP": 300,
+    "AI_TRACK_RADIUS": 100
 }
