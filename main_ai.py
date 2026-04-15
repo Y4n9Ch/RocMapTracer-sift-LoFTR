@@ -745,9 +745,6 @@ class AIMapTrackerApp:
                         self.nav_seq_idx = 0
                         print(f"🔄 路线 [{self.nav_seq_route}] 已自动重置，继续循环导航")
 
-                # 11. 雷达地图上的导航箭头（指向最近未访问点）
-                self.route_mgr.draw_nav_arrow(crop, self.last_x, self.last_y, vx1, vy1, max(current_vw, current_vh))
-
                 # 12. 放入共享变量供主线程 Canvas 渲染
                 with self.lock:
                     self.latest_display_crop = crop
