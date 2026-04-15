@@ -21,5 +21,8 @@ class LoftrEngine:
 
     def match(self, mini_tensor, local_tensor):
         with torch.no_grad():
-            with torch.autocast(device_type='cuda', dtype=torch.float16):
+            if self.device.type == 'cuda':
+                with torch.autocast(device_type='cuda', dtype=torch.float16):
+                    return self.matcher({"image0": mini_tensor, "image1": local_tensor})
+            else:
                 return self.matcher({"image0": mini_tensor, "image1": local_tensor})

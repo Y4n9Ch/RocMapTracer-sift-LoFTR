@@ -11,7 +11,9 @@ import sys
 import subprocess
 import threading
 import time
+import math
 import ctypes
+import ctypes.wintypes
 from ctypes import windll
 from pynput import keyboard
 
@@ -19,8 +21,18 @@ from pynput import keyboard
 # 🌟 导入自定义模块
 from tracker_engine import LoftrEngine
 from route_manager import RouteManager
+from minimap_arrow import detect_arrow_angle
 
 ssl._create_default_https_context = ssl._create_unverified_context
+
+# 隐藏控制台黑框
+if sys.platform == "win32":
+    try:
+        hw = ctypes.windll.kernel32.GetConsoleWindow()
+        if hw:
+            ctypes.windll.user32.ShowWindow(hw, 0)
+    except Exception:
+        pass
 
 
 def run_selector_if_needed(force=False):
@@ -210,6 +222,16 @@ class AIMapTrackerApp:
 
         # 获取初始窗口大小
         self.root.geometry(config.WINDOW_GEOMETRY)
+        self.root.update_idletasks()
+        
+        # 🌟 设置圆角 UI
+        if sys.platform == "win32":
+            try:
+                hwnd = windll.user32.GetParent(self.root.winfo_id())
+                # Windows 11 API (DWMWA_WINDOW_CORNER_PREFERENCE)
+                windll.dwmapi.DwmSetWindowAttribute(hwnd, 33, ctypes.byref(ctypes.c_int(2)), ctypes.sizeof(ctypes.c_int))
+            except Exception:
+                pass
 
         # --- 1. 基础变量初始化 (必须最先定义) ---
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -221,24 +243,56 @@ class AIMapTrackerApp:
         self.display_map_bgr = cv2.imread(config.DISPLAY_MAP_PATH)
 
         # 状态机与追踪变量
-        self.state = "MANUAL_RELOCATE"
+        self.state = "GLOBAL_SCAN"  # 初始状态：先用 SIFT 全图定位
         self.last_x, self.last_y = self.map_width // 2, self.map_height // 2
         self.base_search_radius = config.AI_TRACK_RADIUS
         self.current_search_radius = self.base_search_radius
         self.lost_frames, self.max_lost_frames = 0, 4
         self.smoothed_cx, self.smoothed_cy = None, None
         self.selector_open = False
+        self._selector_window = None
+        self.alt_held = False
+        self._cursor_hidden = False
         self.is_running = True
         self.lock = threading.Lock()
         self.latest_display_crop = None
+
+        # 🌟 小地图朝向角度
+        self.arrow_angle = None
+
+        # 🌟 顺序导航状态机
+        self.nav_active = False          # 导航是否激活（需双击路线点启动）
+        self.nav_seq_route = ""          # 当前导航的路线名
+        self.nav_seq_idx = 0             # 当前导航的目标点索引
+
+        # 🌟 当前视图偏移（供双击选点使用）
+        self.last_vx1 = None
+        self.last_vy1 = None
 
         # 动态视图尺寸变量
         self.view_w = 400
         self.view_h = 400
 
         # --- 2. 核心模块实例化 ---
+        # 2a. AI (LoFTR) 引擎
         self.engine = LoftrEngine(self.device)
         self.route_mgr = RouteManager("routes")
+
+        # 2b. SIFT 全图定位引擎（参考 test/main_sift.py）
+        print("🌍 正在初始化 SIFT 全图定位引擎...")
+        self.clahe = cv2.createCLAHE(clipLimit=config.SIFT_CLAHE_LIMIT, tileGridSize=(8, 8))
+        self.logic_map_gray = cv2.cvtColor(self.logic_map_bgr, cv2.COLOR_BGR2GRAY)
+        self.logic_map_gray = self.clahe.apply(self.logic_map_gray)
+
+        self.sift = cv2.SIFT_create()
+        print("⚙️ 正在提取大地图 SIFT 特征点（仅运行一次，请稍候）...")
+        self.kp_big, self.des_big = self.sift.detectAndCompute(self.logic_map_gray, None)
+        print(f"✅ SIFT 大地图特征初始化完成！共找到 {len(self.kp_big)} 个锚点。")
+
+        FLANN_INDEX_KDTREE = 1
+        index_params = dict(algorithm=FLANN_INDEX_KDTREE, trees=5)
+        search_params = dict(checks=50)
+        self.flann = cv2.FlannBasedMatcher(index_params, search_params)
 
         # --- 3. UI 构建 ---
         # 顶部菜单栏区域
@@ -265,12 +319,12 @@ class AIMapTrackerApp:
                                      command=lambda n=r_name: self.toggle_route(n))
 
         # B. 透明度调节滑动条
-        tk.Label(self.menu_frame, text=" 透明度:", bg="#333333", fg="white", font=("微软雅黑", 9)).pack(side=tk.LEFT,
-                                                                                                        padx=5)
-        self.alpha_scale = tk.Scale(self.menu_frame, from_=0.1, to=1.0, resolution=0.1,
+        tk.Label(self.menu_frame, text=" 👁️ 透明度:", bg="#333333", fg="#00FF00", font=("微软雅黑", 9, "bold")).pack(side=tk.LEFT, padx=2)
+        self.alpha_scale = tk.Scale(self.menu_frame, from_=0.1, to=1.0, resolution=0.05,
                                     orient=tk.HORIZONTAL, command=self.update_alpha,
-                                    bg="#333333", fg="white", highlightthickness=0,
-                                    length=80, showvalue=False)
+                                    bg="#333333", fg="white", highlightthickness=0, bd=0, 
+                                    troughcolor="#1e1e1e", relief=tk.FLAT,
+                                    sliderlength=15, width=8, length=100, showvalue=False)
         self.alpha_scale.set(0.8)
         self.alpha_scale.pack(side=tk.LEFT, padx=5)
 
@@ -290,8 +344,11 @@ class AIMapTrackerApp:
         self.canvas.pack(fill=tk.BOTH, expand=True)
         self.image_on_canvas = None
 
-        # E. 重新选点按钮
-        tk.Button(self.main_frame, text="重新选点", command=self.trigger_manual_relocate,
+        # 🌟 双击路线点启动导航
+        self.canvas.bind("<Double-Button-1>", self.on_canvas_double_click)
+
+        # E. 选择点位按钮
+        tk.Button(self.main_frame, text="选择点位", command=self.trigger_manual_relocate,
                   bg="#4CAF50", fg="white", font=("微软雅黑", 9, "bold"), relief=tk.FLAT).place(x=5, y=5)
 
         # --- 4. 事件绑定 ---
@@ -308,55 +365,107 @@ class AIMapTrackerApp:
         self.ui_render_loop()
 
     def start_hotkey_listener(self):
-        """在独立线程中监听全局热键"""
+        """在独立线程中监听全局热键，包括 Alt 按住/松开"""
 
         def on_press(key):
             # 监听 F9 键
             if key == keyboard.Key.f9:
-                # 切换布尔值并触发逻辑
                 new_state = not self.lock_var.get()
                 self.lock_var.set(new_state)
-                self.toggle_lock()  # 核心切换函数
+                self.root.after(0, self.toggle_lock)
+            # 监听 Home 键
+            elif key == keyboard.Key.home:
+                self.root.after(0, self.trigger_manual_relocate)
+            # 监听 Alt 按下：锁定状态下临时允许点击
+            elif key in (keyboard.Key.alt_l, keyboard.Key.alt_r):
+                if self.lock_var.get() and not self.alt_held:
+                    self.alt_held = True
+                    self.root.after(0, self._on_alt_press)
+
+        def on_release(key):
+            # 监听 Alt 松开：恢复穿透
+            if key in (keyboard.Key.alt_l, keyboard.Key.alt_r):
+                if self.lock_var.get() and self.alt_held:
+                    self.alt_held = False
+                    self.root.after(0, self._on_alt_release)
 
         # 使用守护线程启动，跟随主程序退出
-        listener = keyboard.Listener(on_press=on_press)
+        listener = keyboard.Listener(on_press=on_press, on_release=on_release)
         listener.daemon = True
         listener.start()
 
     def toggle_lock(self):
-        """核心：设置 Windows 鼠标穿透样式与隐藏边框"""
-        import ctypes
+        """核心：锁定时隐藏边框 + 开启鼠标穿透，按住 Alt 临时解除穿透"""
         is_locked = self.lock_var.get()
 
-        # 🌟 1. 处理无边框状态 (必须在获取 Windows 句柄前操作)
         if is_locked:
-            self.root.overrideredirect(True)  # 隐藏系统标题栏和边框
-            # self.menu_frame.pack_forget()   # 💡 可选：连带顶部的菜单栏(透明度、复选框)一起隐藏
+            self.root.overrideredirect(True)
+            self.root.attributes("-alpha", self.alpha_scale.get())
+            self.set_click_through(True)  # 锁定后默认鼠标穿透
+            self._start_cursor_poll()  # 启动光标检测轮询
+            print(">>> [已锁定] 鼠标穿透已开启，经过窗口光标自动隐藏，按住 Alt 可临时操作按钮，按 F9 解锁")
         else:
-            self.root.overrideredirect(False)  # 恢复系统标题栏和边框
-            # self.menu_frame.pack(side=tk.TOP, fill=tk.X, before=self.main_frame) # 💡 可选：如果上面隐藏了菜单栏，这里负责恢复它
+            self.alt_held = False
+            self._restore_cursor()  # 解锁时恢复光标
+            self.set_click_through(False)
+            self.root.overrideredirect(False)
+            self.root.attributes("-alpha", 1.0)
+            print(">>> [已解锁] 边框已恢复，窗口可自由操作")
 
-        self.root.update_idletasks()  # 强制刷新窗口状态，确保后续获取到的句柄是准确的
+        self.root.update_idletasks()
 
-        # 🌟 2. 获取窗口句柄并设置穿透
-        hwnd = ctypes.windll.user32.GetParent(self.root.winfo_id())
-        GWL_EXSTYLE = -20
-        WS_EX_TRANSPARENT = 0x20
-        WS_EX_LAYERED = 0x80000
+    def _on_alt_press(self):
+        """按住 Alt 时：临时取消穿透，窗口变不透明，恢复光标，允许点击按钮"""
+        self._restore_cursor()
+        self.set_click_through(False)
+        self.root.attributes("-alpha", 1.0)
+        print(">>> [Alt 按下] 临时解除穿透，可操作按钮")
 
-        # 获取当前样式
-        style = ctypes.windll.user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
+    def _on_alt_release(self):
+        """松开 Alt 时：恢复穿透和透明度"""
+        self.set_click_through(True)
+        self.root.attributes("-alpha", self.alpha_scale.get())
+        print(">>> [Alt 松开] 恢复穿透模式")
 
-        if is_locked:
-            # 开启穿透：添加透明和层叠样式
-            ctypes.windll.user32.SetWindowLongW(hwnd, GWL_EXSTYLE, style | WS_EX_LAYERED | WS_EX_TRANSPARENT)
-            self.root.attributes("-alpha", self.alpha_scale.get())  # 保持设定的透明度
-            print(">>> [已锁定] 鼠标已穿透，边框已隐藏，按 F9 解锁")
-        else:
-            # 关闭穿透：移除透明样式
-            ctypes.windll.user32.SetWindowLongW(hwnd, GWL_EXSTYLE, style & ~WS_EX_TRANSPARENT)
-            self.root.attributes("-alpha", 1.0)  # 解锁时自动恢复清晰，方便操作
-            print(">>> [已解锁] 鼠标恢复交互，边框已恢复")
+    # --- 光标显示/隐藏管理 ---
+
+    def _start_cursor_poll(self):
+        """启动光标位置轮询，检测光标是否在窗口区域内"""
+        self._cursor_poll()
+
+    def _cursor_poll(self):
+        """定时检测光标位置，在窗口区域内时隐藏光标"""
+        if not self.lock_var.get():
+            return  # 未锁定时停止轮询
+
+        if not self.alt_held:
+            over = self._is_cursor_over_window()
+            if over and not self._cursor_hidden:
+                windll.user32.ShowCursor(False)
+                self._cursor_hidden = True
+            elif not over and self._cursor_hidden:
+                windll.user32.ShowCursor(True)
+                self._cursor_hidden = False
+
+        self.root.after(50, self._cursor_poll)  # 50ms 轮询一次
+
+    def _is_cursor_over_window(self):
+        """检测鼠标光标是否在窗口矩形区域内"""
+        try:
+            pt = ctypes.wintypes.POINT()
+            windll.user32.GetCursorPos(ctypes.byref(pt))
+            hwnd = windll.user32.GetParent(self.root.winfo_id())
+            rect = ctypes.wintypes.RECT()
+            windll.user32.GetWindowRect(hwnd, ctypes.byref(rect))
+            return rect.left <= pt.x <= rect.right and rect.top <= pt.y <= rect.bottom
+        except Exception:
+            return False
+
+    def _restore_cursor(self):
+        """如果光标被隐藏，恢复显示"""
+        if self._cursor_hidden:
+            windll.user32.ShowCursor(True)
+            self._cursor_hidden = False
 
     def _on_mouse_enter(self, event):
         if not self.lock_var.get():
@@ -368,29 +477,19 @@ class AIMapTrackerApp:
 
     def set_click_through(self, enabled=True):
         """设置窗口是否允许鼠标穿透"""
-        # 获取窗口句柄 (HWND)
         hwnd = windll.user32.GetParent(self.root.winfo_id())
-
-        # 定义 Windows 常量
         GWL_EXSTYLE = -20
         WS_EX_LAYERED = 0x80000
         WS_EX_TRANSPARENT = 0x20
-
-        # 获取当前样式
         style = windll.user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
 
         if enabled:
-            # 开启穿透：添加透明和层叠样式
             windll.user32.SetWindowLongW(hwnd, GWL_EXSTYLE, style | WS_EX_LAYERED | WS_EX_TRANSPARENT)
-            print(">>> 雷达已锁定：鼠标将直接穿透，不再显示箭头")
         else:
-            # 关闭穿透：移除透明样式（保留层叠以维持 alpha 透明度）
             windll.user32.SetWindowLongW(hwnd, GWL_EXSTYLE, style & ~WS_EX_TRANSPARENT)
-            print(">>> 雷达已解锁：现在可以操作菜单")
 
     def update_alpha(self, value):
         """同时改变窗口和地图的透明度"""
-        # 这个属性会作用于整个窗口，包括地图图片、路线和按钮
         self.root.attributes("-alpha", float(value))
 
     def toggle_route(self, name):
@@ -400,10 +499,44 @@ class AIMapTrackerApp:
         print(f"路线 [{name}] 显示状态修改为: {new_state}")
 
     def trigger_manual_relocate(self):
-        self.selector_open = False  # 强制重置一次标志位，确保能打开
+        if self.state == "MANUAL_RELOCATE" and self.selector_open:
+            self._close_selector_window()
+            return
+        self.selector_open = False
         self.state = "MANUAL_RELOCATE"
 
-        # 🌟 新增：处理选点窗口关闭时的回调
+    def on_canvas_double_click(self, event):
+        """双击雷达Canvas上的路线点，启动顺序导航"""
+        # 需要有当前视图偏移量
+        if not hasattr(self, 'last_vx1') or self.last_vx1 is None:
+            print("⚠️ 还未开始追踪，无法选点")
+            return
+
+        # 在路线点中查找被双击的点
+        route_name, point_idx, point_dict = self.route_mgr.find_clicked_point(
+            event.x, event.y, self.last_vx1, self.last_vy1, threshold=15
+        )
+
+        if route_name is not None:
+            self.nav_active = True
+            self.nav_seq_route = route_name
+            self.nav_seq_idx = point_idx
+            print(f"🎯 导航已激活！路线: [{route_name}], 起始点: #{point_idx}")
+        else:
+            print("双击位置附近未找到路线点")
+
+    def _close_selector_window(self):
+        """关闭已打开的选点窗口并恢复追踪状态"""
+        if hasattr(self, '_selector_window') and self._selector_window is not None:
+            try:
+                self._selector_window.top.destroy()
+            except Exception:
+                pass
+            self._selector_window = None
+        self.selector_open = False
+        self.state = "LOCAL_TRACK"
+
+    # 🌟 处理选点窗口关闭时的回调
     def reset_selector_flag(self):
         self.selector_open = False
         # 如果用户关闭了选点窗口，把状态改回本地追踪，防止它死循环反复弹出
@@ -426,8 +559,9 @@ class AIMapTrackerApp:
             self.view_w = self.canvas.winfo_width()
             self.view_h = self.canvas.winfo_height()
 
+
     def ai_worker_loop(self):
-        """后台 AI 推理线程 - 支持动态窗口缩放"""
+        """后台 AI 推理线程 - SIFT 先行定位 + AI 精确追踪混合引擎"""
         with mss.mss() as sct:
             while self.is_running:
                 # 1. 拦截：手动定位模式时降低功耗
@@ -437,8 +571,7 @@ class AIMapTrackerApp:
 
                 start_time = time.time()
 
-                # 2. 获取当前窗口实时尺寸 (由主线程 Configure 事件更新)
-                # 使用局部变量防止计算过程中尺寸突变导致数组越界
+                # 2. 获取当前窗口实时尺寸
                 current_vw = self.view_w
                 current_vh = self.view_h
                 half_vw = current_vw // 2
@@ -455,84 +588,167 @@ class AIMapTrackerApp:
 
                 found = False
 
-                # 4. 确定 AI 搜索区域 (基于逻辑地图)
-                x1 = max(0, self.last_x - self.current_search_radius)
-                y1 = max(0, self.last_y - self.current_search_radius)
-                x2 = min(self.map_width, self.last_x + self.current_search_radius)
-                y2 = min(self.map_height, self.last_y + self.current_search_radius)
+                # 🌟 检测小地图箭头朝向
+                try:
+                    detected_angle = detect_arrow_angle(
+                        mini_bgr,
+                        hsv_low=config.ARROW_HSV_LOW,
+                        hsv_high=config.ARROW_HSV_HIGH,
+                        min_pixels=config.ARROW_MIN_PIXELS
+                    )
+                    if detected_angle is not None:
+                        self.arrow_angle = detected_angle
+                except Exception:
+                    pass
 
-                local_map = self.logic_map_bgr[y1:y2, x1:x2]
+                # ==========================================
+                # 🌟 状态机核心逻辑
+                # ==========================================
 
-                # 5. 执行 AI 特征匹配
-                if local_map.shape[0] >= 16 and local_map.shape[1] >= 16:
-                    t_mini = self.engine.preprocess(mini_bgr)
-                    t_local = self.engine.preprocess(local_map)
+                if self.state == "GLOBAL_SCAN":
+                    # --- SIFT 全图定位 ---
+                    minimap_gray = cv2.cvtColor(mini_bgr, cv2.COLOR_BGR2GRAY)
+                    minimap_gray = self.clahe.apply(minimap_gray)
+                    mh, mw = minimap_gray.shape
 
-                    corr = self.engine.match(t_mini, t_local)
-                    mk0, mk1 = corr['keypoints0'].cpu().numpy(), corr['keypoints1'].cpu().numpy()
-                    conf = corr['confidence'].cpu().numpy()
+                    kp_mini, des_mini = self.sift.detectAndCompute(minimap_gray, None)
 
-                    v_idx = conf > config.AI_CONFIDENCE_THRESHOLD
-                    mk0, mk1 = mk0[v_idx], mk1[v_idx]
+                    if des_mini is not None and len(kp_mini) >= 2:
+                        matches = self.flann.knnMatch(des_mini, self.des_big, k=2)
 
-                    if len(mk0) >= config.AI_MIN_MATCH_COUNT:
-                        M, _ = cv2.findHomography(mk0, mk1, cv2.RANSAC, config.AI_RANSAC_THRESHOLD)
-                        if M is not None:
-                            h, w = mini_bgr.shape[:2]
-                            center = cv2.perspectiveTransform(np.float32([[[w / 2, h / 2]]]), M)
-                            rx, ry = center[0][0][0] + x1, center[0][0][1] + y1
+                        good_matches = []
+                        for m_n in matches:
+                            if len(m_n) == 2:
+                                m, n = m_n
+                                if m.distance < config.SIFT_MATCH_RATIO * n.distance:
+                                    good_matches.append(m)
 
-                            if 0 <= rx < self.map_width and 0 <= ry < self.map_height:
-                                if self.smoothed_cx is None:
-                                    self.smoothed_cx, self.smoothed_cy = rx, ry
-                                else:
-                                    dist = np.sqrt((rx - self.smoothed_cx) ** 2 + (ry - self.smoothed_cy) ** 2)
-                                    if dist < 500:  # 允许合理范围内的位置跳变
-                                        alpha = 0.15 if dist < 15 else 0.45
-                                        self.smoothed_cx = alpha * rx + (1 - alpha) * self.smoothed_cx
-                                        self.smoothed_cy = alpha * ry + (1 - alpha) * self.smoothed_cy
-                                        found = True
+                        if len(good_matches) >= config.SIFT_MIN_MATCH_COUNT:
+                            src_pts = np.float32([kp_mini[m.queryIdx].pt for m in good_matches]).reshape(-1, 1, 2)
+                            dst_pts = np.float32([self.kp_big[m.trainIdx].pt for m in good_matches]).reshape(-1, 1, 2)
 
-                # 6. 状态维护
-                if found:
-                    self.last_x, self.last_y = int(self.smoothed_cx), int(self.smoothed_cy)
-                    self.lost_frames, self.current_search_radius = 0, self.base_search_radius
-                else:
-                    self.lost_frames += 1
-                    if self.lost_frames == 1:
-                        self.current_search_radius += 300  # 丢失首帧扩大搜索圈
-                    if self.lost_frames > self.max_lost_frames:
-                        self.state = "MANUAL_RELOCATE"
+                            M, mask = cv2.findHomography(src_pts, dst_pts, cv2.RANSAC, config.SIFT_RANSAC_THRESHOLD)
+
+                            if M is not None:
+                                center_pt = np.float32([[[mw / 2, mh / 2]]])
+                                dst_center = cv2.perspectiveTransform(center_pt, M)
+                                temp_x = int(dst_center[0][0][0])
+                                temp_y = int(dst_center[0][0][1])
+
+                                if 0 <= temp_x < self.map_width and 0 <= temp_y < self.map_height:
+                                    found = True
+                                    self.last_x, self.last_y = temp_x, temp_y
+                                    self.smoothed_cx, self.smoothed_cy = float(temp_x), float(temp_y)
+                                    self.lost_frames = 0
+                                    self.current_search_radius = self.base_search_radius
+                                    self.state = "LOCAL_TRACK"
+                                    print(f"✅ SIFT 全图定位成功！匹配点数={len(good_matches)}, 坐标: X={temp_x}, Y={temp_y} → 切换至 AI 追踪")
+
+                    if not found:
+                        print("⛳ SIFT 全图扫描中，尚未匹配成功...")
+
+                elif self.state == "LOCAL_TRACK":
+                    # --- AI (LoFTR) 局部精确追踪 ---
+                    x1 = max(0, self.last_x - self.current_search_radius)
+                    y1 = max(0, self.last_y - self.current_search_radius)
+                    x2 = min(self.map_width, self.last_x + self.current_search_radius)
+                    y2 = min(self.map_height, self.last_y + self.current_search_radius)
+
+                    local_map = self.logic_map_bgr[y1:y2, x1:x2]
+
+                    if local_map.shape[0] >= 16 and local_map.shape[1] >= 16:
+                        t_mini = self.engine.preprocess(mini_bgr)
+                        t_local = self.engine.preprocess(local_map)
+
+                        corr = self.engine.match(t_mini, t_local)
+                        mk0, mk1 = corr['keypoints0'].cpu().numpy(), corr['keypoints1'].cpu().numpy()
+                        conf = corr['confidence'].cpu().numpy()
+
+                        v_idx = conf > config.AI_CONFIDENCE_THRESHOLD
+                        mk0, mk1 = mk0[v_idx], mk1[v_idx]
+
+                        if len(mk0) >= config.AI_MIN_MATCH_COUNT:
+                            M, _ = cv2.findHomography(mk0, mk1, cv2.RANSAC, config.AI_RANSAC_THRESHOLD)
+                            if M is not None:
+                                h, w = mini_bgr.shape[:2]
+                                center = cv2.perspectiveTransform(np.float32([[[w / 2, h / 2]]]), M)
+                                rx, ry = center[0][0][0] + x1, center[0][0][1] + y1
+
+                                if 0 <= rx < self.map_width and 0 <= ry < self.map_height:
+                                    if self.smoothed_cx is None:
+                                        self.smoothed_cx, self.smoothed_cy = rx, ry
+                                    else:
+                                        dist = np.sqrt((rx - self.smoothed_cx) ** 2 + (ry - self.smoothed_cy) ** 2)
+                                        if dist < 500:
+                                            alpha = 0.15 if dist < 15 else 0.45
+                                            self.smoothed_cx = alpha * rx + (1 - alpha) * self.smoothed_cx
+                                            self.smoothed_cy = alpha * ry + (1 - alpha) * self.smoothed_cy
+                                            found = True
+
+                    # 状态维护
+                    if found:
+                        self.last_x, self.last_y = int(self.smoothed_cx), int(self.smoothed_cy)
+                        self.lost_frames, self.current_search_radius = 0, self.base_search_radius
+                    else:
+                        self.lost_frames += 1
+                        if self.lost_frames == 1:
+                            self.current_search_radius += 300
+                        elif self.lost_frames >= 5:
+                            # AI 连续丢失 5 帧，回退给 SIFT 重新全图定位
+                            print(f"⚠️ AI 连续丢失 {self.lost_frames} 帧，回退至 SIFT 全图定位...")
+                            self.state = "GLOBAL_SCAN"
+                            self.lost_frames = 0
+                            self.smoothed_cx, self.smoothed_cy = None, None
 
                 # 7. 动态渲染裁剪 (核心修改：使用窗口实时宽高)
                 vx1, vy1 = max(0, self.last_x - half_vw), max(0, self.last_y - half_vh)
                 vx2, vy2 = min(self.map_width, self.last_x + half_vw), min(self.map_height, self.last_y + half_vh)
 
+                # 🌟 存储当前视图偏移（供双击查找路线点使用）
+                self.last_vx1 = vx1
+                self.last_vy1 = vy1
+
                 # 裁剪展示用大地图
                 crop = self.display_map_bgr[vy1:vy2, vx1:vx2].copy()
 
-                # 8. 绘制路线 (传递动态窗口尺寸以适配绘制逻辑)
-                # 这里假设 RouteManager.draw_on 的最后一个参数改为最大边长或自适应
-                # 传入 self.last_x 和 self.last_y 作为人物当前位置
+                # 8. 绘制路线
                 self.route_mgr.draw_on(crop, vx1, vy1, max(current_vw, current_vh), self.last_x, self.last_y)
 
                 # 9. 绘制玩家箭头 (原生小地图箭头抠图)
                 mh, mw = mini_bgr.shape[:2]
                 asize = 12
-                # 提取小地图中心的箭头
                 arrow = mini_bgr[mh // 2 - asize: mh // 2 + asize, mw // 2 - asize: mw // 2 + asize].copy()
 
-                # 计算箭头在 crop 上的局部坐标
                 ay_local, ax_local = self.last_y - vy1 - asize, self.last_x - vx1 - asize
 
-                # 检查边界防止绘制越界
                 if 0 <= ay_local < crop.shape[0] - 2 * asize and 0 <= ax_local < crop.shape[1] - 2 * asize:
                     roi = crop[ay_local: ay_local + 2 * asize, ax_local: ax_local + 2 * asize]
-                    # 透明度融合
                     crop[ay_local: ay_local + 2 * asize, ax_local: ax_local + 2 * asize] = \
                         cv2.addWeighted(arrow, 0.8, roi, 0.2, 0)
 
-                # 10. 放入共享变量供主线程 Canvas 渲染
+                # 10. 🌟 顺序导航：当导航激活时，追踪当前目标点
+                if self.nav_active and self.nav_seq_route:
+                    target_point, new_idx = self.route_mgr.get_sequential_target(
+                        self.nav_seq_route, self.nav_seq_idx
+                    )
+                    if target_point is not None:
+                        self.nav_seq_idx = new_idx
+                        target_lx = int(target_point["x"] - vx1)
+                        target_ly = int(target_point["y"] - vy1)
+
+                        # 在目标点画一个高亮标记（绿色大圆环）
+                        if (0 <= target_lx < crop.shape[1] and 0 <= target_ly < crop.shape[0]):
+                            cv2.circle(crop, (target_lx, target_ly), 12, (0, 255, 0), 2)
+                            cv2.circle(crop, (target_lx, target_ly), 4, (0, 255, 0), -1)
+                    else:
+                        # 防御性分支：理论上不会进入（get_sequential_target 会自动重置）
+                        self.nav_seq_idx = 0
+                        print(f"🔄 路线 [{self.nav_seq_route}] 已自动重置，继续循环导航")
+
+                # 11. 雷达地图上的导航箭头（指向最近未访问点）
+                self.route_mgr.draw_nav_arrow(crop, self.last_x, self.last_y, vx1, vy1, max(current_vw, current_vh))
+
+                # 12. 放入共享变量供主线程 Canvas 渲染
                 with self.lock:
                     self.latest_display_crop = crop
 
@@ -550,7 +766,7 @@ class AIMapTrackerApp:
             if not self.selector_open:
                 self.selector_open = True
                 torch.cuda.empty_cache()
-                MapSelectorWindow(
+                self._selector_window = MapSelectorWindow(
                     self.root,
                     self.display_map_bgr,
                     (self.map_height, self.map_width),
@@ -590,6 +806,8 @@ class AIMapTrackerApp:
         self.root.after(30, self.ui_render_loop)
 
     def _render_to_canvas(self, crop):
+        if crop is None or crop.shape[0] == 0 or crop.shape[1] == 0:
+            return
         rgb = cv2.cvtColor(crop, cv2.COLOR_BGR2RGB)
         self.tk_image = ImageTk.PhotoImage(Image.fromarray(rgb))
         if self.image_on_canvas is None:

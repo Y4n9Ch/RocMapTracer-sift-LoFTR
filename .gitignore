@@ -1,20 +1,64 @@
-```text
-# 忽略 Python 缓存
+# Python
 __pycache__/
 *.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
 
-# 忽略虚拟环境
+# Virtual Environment
+.venv/
 venv/
+ENV/
 env/
 
-# 忽略巨型地图文件 (极其重要)
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# PyInstaller
+*.spec
+
+# Logs
+*.log
+
+# Temporary files
+*.tmp
+.cache/
+
+# Large image files
 *.png
 *.jpg
-!img/    # 但是保留 img 文件夹里的小图标
+*.jpeg
+*.bmp
+*.gif
 
-# 忽略调试生成的图片
-debug_minimap.png
+# Model checkpoint files
+*.ckpt
+*.pth
+*.pt
+*.onnx
 
-# 忽略 IDE 配置文件
-.idea/
-.vscode/
+# Test/dump folders
+cmptest/
