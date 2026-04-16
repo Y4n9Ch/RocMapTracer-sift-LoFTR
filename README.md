@@ -88,7 +88,10 @@ pip install -r requirements.txt
 # 3. 安装 PyTorch GPU 版（关键！pip 默认装 CPU 版）
 # 请前往 https://pytorch.org 选择对应 CUDA 版本的安装命令
 
-# 4. 首次运行（会弹出小地图校准器）
+# 4. 下载大地图
+python download_map.py
+
+# 5. 首次运行（会弹出小地图校准器）
 python main_ai.py
 ```
 
